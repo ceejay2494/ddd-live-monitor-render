@@ -80,6 +80,7 @@ _state = {
     "telegram_chat_resolved": bool(TELEGRAM_CHAT_ID),
     "telegram_last_sent_utc": None,
     "telegram_last_error": None,
+    "telegram_connection_announced": False,
     "rollover_mode": ROLLOVER_MODE,
     "rollover_active": None,
     "rollover_chain_no": 0,
@@ -207,6 +208,7 @@ def _closest_board(opp, limit=8):
 
 _telegram_chat_cache = TELEGRAM_CHAT_ID or None
 _telegram_last_signature = None
+_telegram_connection_announced = False
 
 def _font(size, bold=False):
     candidates = [
@@ -262,6 +264,54 @@ def _resolve_telegram_chat_id():
         with _lock:
             _state["telegram_last_error"] = f"chat resolve: {type(e).__name__}: {e}"
     return None
+
+
+def _telegram_startup_confirm_once():
+    """Send one confirmation per running Render process, retrying until /start is visible."""
+    global _telegram_connection_announced
+    if _telegram_connection_announced or not TELEGRAM_BOT_TOKEN:
+        return _telegram_connection_announced
+
+    chat_id = _resolve_telegram_chat_id()
+    if not chat_id:
+        return False
+
+    text = (
+        "✅ DDD Telegram connected\n"
+        "V7.2 Top-1 rollover monitor is online.\n\n"
+        "• Live scan: every 5 minutes\n"
+        "• Normal rollover odds floor: 1.25\n"
+        "• Preferred odds zone: 1.30–1.55\n"
+        "• 1.20–1.24 only for exceptional ≥90% model signals\n"
+        "• One active rollover signal at a time\n\n"
+        "Waiting for the next qualifying live signal."
+    )
+
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={"chat_id": chat_id, "text": text},
+            timeout=20,
+        )
+        data = r.json()
+        if not data.get("ok"):
+            raise RuntimeError(data.get("description") or "Telegram startup confirmation failed")
+
+        _telegram_connection_announced = True
+        with _lock:
+            _state["telegram_connection_announced"] = True
+            _state["telegram_last_sent_utc"] = datetime.now(timezone.utc).isoformat()
+            _state["telegram_last_error"] = None
+            _state["telegram_chat_resolved"] = True
+
+        print("TELEGRAM: connection confirmation sent")
+        return True
+
+    except Exception as e:
+        with _lock:
+            _state["telegram_last_error"] = f"startup confirm: {type(e).__name__}: {e}"
+        print(f"TELEGRAM STARTUP CONFIRM ERROR: {type(e).__name__}: {e}")
+        return False
 
 def _official_signature(rows):
     bits = []
@@ -885,6 +935,7 @@ def scanner_loop():
             _state["cycle"] += 1
             cycle = _state["cycle"]
         try:
+            _telegram_startup_confirm_once()
             snapshot, interval = run_scan()
             with _lock:
                 quota_fields = {
@@ -942,6 +993,7 @@ def health():
             "telegram_chat_resolved": _state["telegram_chat_resolved"],
             "telegram_last_sent_utc": _state["telegram_last_sent_utc"],
             "telegram_last_error": _state["telegram_last_error"],
+            "telegram_connection_announced": _state["telegram_connection_announced"],
             "rollover_mode": _state["rollover_mode"],
             "rollover_active": _state["rollover_active"],
             "rollover_chain_no": _state["rollover_chain_no"],
