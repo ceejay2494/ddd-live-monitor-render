@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-DDD LIVE VALUE ENGINE V7.2 — FAST MOMENTUM PERIOD-AWARE
+DDD LIVE VALUE ENGINE V7.3 — PRESSURE-FIRST GOAL + FAST MOMENTUM
 
 ONE RUN:
 1) Mount Google Drive.
@@ -60,14 +60,24 @@ FAST_PERIOD_MIN_PROB = 0.80
 LATE_1H_MINUTE = 36
 MAX_1H_EXECUTION_MINUTE = 44
 
-# V7.2 recent-momentum layer. It changes the expected future event rate, not the
+# V7.3 recent-pressure layer. It changes expected event rates, never the
 # probability threshold. State lives in memory across repeated live scans.
-RECENT_MOMENTUM_MAX_MINUTES = 8
+RECENT_MOMENTUM_MAX_MINUTES = 10
 CORNER_MOMENTUM_MIN_MULT = 0.82
 CORNER_MOMENTUM_MAX_MULT = 1.32
 MOMENTUM_FAST_MIN_MULT = 1.15
 MOMENTUM_FAST_MIN_PROB = 0.80
 MOMENTUM_FAST_MAX_MINUTES_TO_SETTLE = 20
+
+# Goal-imminence research lane inspired by pressure-first live modelling.
+# It remains separate from HARD80: the 0-100 score is a pressure score, not a
+# claimed win probability. Actual betting eligibility still uses model probability,
+# edge, EV and data-quality gates below.
+GOAL_PRESSURE_MIN_MULT = 0.80
+GOAL_PRESSURE_MAX_MULT = 1.38
+GOAL_IMMINENCE_MIN_SCORE = float(os.environ.get("DDD_GOAL_IMMINENCE_MIN_SCORE", "70"))
+GOAL_IMMINENCE_MIN_MODEL_PROB = float(os.environ.get("DDD_GOAL_IMMINENCE_MIN_MODEL_PROB", "0.70"))
+GOAL_IMMINENCE_MAX_MINUTES_TO_SETTLE = int(os.environ.get("DDD_GOAL_IMMINENCE_MAX_MINUTES_TO_SETTLE", "30"))
 _RECENT_MOMENTUM_STATE = {}
 
 # Newer families are deliberately shrunk toward 50% until the persistent
@@ -124,7 +134,7 @@ def api_get(path, params=None, key=None):
         url += "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(
         url,
-        headers={"x-apisports-key": key, "User-Agent": "DDD-Live-Value-Engine/7.2"},
+        headers={"x-apisports-key": key, "User-Agent": "DDD-Live-Value-Engine/7.3"},
     )
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as r:
         data = json.loads(r.read().decode("utf-8"))
@@ -412,6 +422,13 @@ def parse_stats(stats_resp):
         v = d.get(name, np.nan)
         return float(v) if not pd.isna(v) else np.nan
 
+    def first_available(d, *names):
+        for name in names:
+            v = get(d, name)
+            if not pd.isna(v):
+                return v
+        return np.nan
+
     return {
         "home_sot": get(h,"Shots on Goal"),
         "away_sot": get(a,"Shots on Goal"),
@@ -425,6 +442,12 @@ def parse_stats(stats_resp):
         "away_red": get(a,"Red Cards"),
         "home_yellow": get(h,"Yellow Cards"),
         "away_yellow": get(a,"Yellow Cards"),
+        # API-Football availability varies by competition. Use actual xG/dangerous
+        # attacks when supplied; otherwise the pressure model falls back gracefully.
+        "home_xg": first_available(h,"expected_goals","Expected Goals","Expected goals"),
+        "away_xg": first_available(a,"expected_goals","Expected Goals","Expected goals"),
+        "home_dangerous_attacks": first_available(h,"Dangerous Attacks","Dangerous attacks"),
+        "away_dangerous_attacks": first_available(a,"Dangerous Attacks","Dangerous attacks"),
     }
 
 
@@ -559,6 +582,30 @@ def poisson_tail_at_least(k, lam):
     return 1.0 - poisson_cdf(k-1, lam)
 
 
+def _goal_phase_multiplier(elapsed):
+    """Conservative generic minute prior. Team-specific priors can be added later
+    without extra live API calls. Values are deliberately close to 1.0."""
+    e=float(elapsed)
+    if e < 16: return 0.90
+    if e < 31: return 0.96
+    if e < 46: return 1.04
+    if e < 61: return 1.00
+    if e < 76: return 1.07
+    return 1.14
+
+
+def _recent_goal_adjustment(stats, strength=0.50):
+    mult=fnum(stats.get("goal_pressure_multiplier"))
+    if pd.isna(mult): mult=1.0
+    phase=fnum(stats.get("goal_phase_multiplier"))
+    if pd.isna(phase): phase=1.0
+    # Shrink both modifiers toward 1.0 because cumulative shots/SOT already enter
+    # the base tempo model. This avoids double-counting the same evidence.
+    recent=1.0 + float(strength)*(float(mult)-1.0)
+    phase_adj=1.0 + 0.30*(float(phase)-1.0)
+    return float(np.clip(recent*phase_adj, 0.78, 1.28))
+
+
 def live_goal_lambda(elapsed, stats, score_total):
     elapsed = max(1.0, min(89.0, float(elapsed)))
     rem = 90.0 - elapsed
@@ -574,7 +621,7 @@ def live_goal_lambda(elapsed, stats, score_total):
         tempo *= 1.08
     if score_total >= 1:
         tempo *= 1.04
-    return max(0.05, base_remaining*tempo)
+    return max(0.05, base_remaining*tempo*_recent_goal_adjustment(stats,0.50))
 
 
 def first_half_goal_lambda(elapsed, stats, score_total):
@@ -589,7 +636,7 @@ def first_half_goal_lambda(elapsed, stats, score_total):
     tempo = 0.58 + 0.42*np.clip(raw, 0.35, 2.0)
     if score_total >= 1:
         tempo *= 1.03
-    return max(0.03, 1.10*rem/45.0*tempo)
+    return max(0.03, 1.10*rem/45.0*tempo*_recent_goal_adjustment(stats,0.58))
 
 
 def second_half_goal_lambda(elapsed, stats, second_half_score_total):
@@ -606,8 +653,7 @@ def second_half_goal_lambda(elapsed, stats, second_half_score_total):
     tempo = 0.58 + 0.42*np.clip(raw, 0.35, 2.0)
     if second_half_score_total >= 1:
         tempo *= 1.03
-    return max(0.03, 1.45*rem/45.0*tempo)
-
+    return max(0.03, 1.45*rem/45.0*tempo*_recent_goal_adjustment(stats,0.60))
 
 def second_half_goal_side_lambdas(elapsed, stats, shg, sag):
     total = second_half_goal_lambda(elapsed, stats, shg+sag)
@@ -834,51 +880,135 @@ def _sum_known(stats, a, b):
     return float(x) + float(y)
 
 
-def _update_recent_momentum(fid, elapsed, stats):
-    """Compute a bounded recent 1-8 minute pressure signal from consecutive scans.
-
-    Corner acceleration dominates. Shots/SOT are supporting evidence. A first scan
-    stays neutral. The state is intentionally tiny and in-memory for speed.
-    """
-    cur = {
+def _pressure_sample(stats, elapsed):
+    return {
         "minute": float(elapsed),
         "corners": _sum_known(stats, "home_corners", "away_corners"),
         "shots": _sum_known(stats, "home_shots", "away_shots"),
         "sot": _sum_known(stats, "home_sot", "away_sot"),
+        "xg": _sum_known(stats, "home_xg", "away_xg"),
+        "danger": _sum_known(stats, "home_dangerous_attacks", "away_dangerous_attacks"),
     }
-    prev = _RECENT_MOMENTUM_STATE.get(int(fid))
-    dm = np.nan; dc = ds = dst = np.nan
-    mult = 1.0; signal = 1.0
 
-    if prev is not None:
-        dm = float(cur["minute"] - prev.get("minute", cur["minute"]))
-        if 1.0 <= dm <= float(RECENT_MOMENTUM_MAX_MINUTES):
-            def delta(k):
-                a, b = cur.get(k), prev.get(k)
-                if pd.isna(a) or pd.isna(b):
-                    return np.nan
-                return max(0.0, float(a) - float(b))
-            dc, ds, dst = delta("corners"), delta("shots"), delta("sot")
 
-            # Ratios versus normal per-minute football event rates. Extreme bursts
-            # are clipped so one noisy API update cannot dominate the model.
-            cr = 1.0 if pd.isna(dc) else np.clip((dc/dm)/(9.5/90.0), 0.0, 3.0)
-            sr = 1.0 if pd.isna(ds) else np.clip((ds/dm)/(24.0/90.0), 0.0, 2.5)
-            tr = 1.0 if pd.isna(dst) else np.clip((dst/dm)/(8.4/90.0), 0.0, 3.0)
-            signal = 0.65*cr + 0.22*sr + 0.13*tr
-            mult = float(np.clip(1.0 + 0.22*(signal-1.0),
-                                 CORNER_MOMENTUM_MIN_MULT,
-                                 CORNER_MOMENTUM_MAX_MULT))
+def _window_delta(history, cur, target_minutes):
+    """Return deltas to the oldest usable sample no more than target_minutes back."""
+    candidates=[]
+    for prev in history:
+        dm=float(cur["minute"]-prev.get("minute",cur["minute"]))
+        if 1.0 <= dm <= float(target_minutes):
+            candidates.append((dm,prev))
+    if not candidates:
+        return {"minutes":np.nan,"corners":np.nan,"shots":np.nan,"sot":np.nan,"xg":np.nan,"danger":np.nan}
+    dm,prev=max(candidates,key=lambda x:x[0])
+    out={"minutes":dm}
+    for k in ("corners","shots","sot","xg","danger"):
+        a,b=cur.get(k),prev.get(k)
+        out[k]=np.nan if pd.isna(a) or pd.isna(b) else max(0.0,float(a)-float(b))
+    return out
 
-    stats["recent_window_minutes"] = dm
-    stats["recent_corners_delta"] = dc
-    stats["recent_shots_delta"] = ds
-    stats["recent_sot_delta"] = dst
-    stats["corner_momentum_signal"] = signal
-    stats["corner_momentum_multiplier"] = mult
-    _RECENT_MOMENTUM_STATE[int(fid)] = cur
-    return mult
 
+def _pressure_components(win):
+    dm=fnum(win.get("minutes"))
+    if pd.isna(dm) or dm <= 0:
+        return {"signal":1.0,"xg_proxy":0.0,"xg_ratio":1.0}
+    dc,ds,dst=[fnum(win.get(k)) for k in ("corners","shots","sot")]
+    cr=1.0 if pd.isna(dc) else np.clip((dc/dm)/(9.5/90.0),0.0,3.0)
+    sr=1.0 if pd.isna(ds) else np.clip((ds/dm)/(24.0/90.0),0.0,3.0)
+    tr=1.0 if pd.isna(dst) else np.clip((dst/dm)/(8.4/90.0),0.0,3.5)
+
+    actual_xg=fnum(win.get("xg"))
+    # Conservative xG proxy: SOT carries most weight, non-SOT attempts and corners
+    # carry much less. It is diagnostic when provider xG is absent, not true event xG.
+    shots_non_sot=max(0.0,(0.0 if pd.isna(ds) else ds)-(0.0 if pd.isna(dst) else dst))
+    xg_proxy=(0.28*(0.0 if pd.isna(dst) else dst) + 0.045*shots_non_sot + 0.018*(0.0 if pd.isna(dc) else dc))
+    xg_used=xg_proxy if pd.isna(actual_xg) else max(0.0,float(actual_xg))
+    xgr=np.clip((xg_used/dm)/(2.55/90.0),0.0,4.0)
+    signal=float(0.46*tr + 0.25*sr + 0.19*xgr + 0.10*cr)
+    return {"signal":signal,"xg_proxy":float(xg_proxy),"xg_ratio":float(xgr)}
+
+
+def _update_recent_momentum(fid, elapsed, stats):
+    """Compute 5/10-minute pressure, acceleration and bounded rate multipliers.
+
+    The 0-100 goal-imminence score is a pressure index only. It never replaces the
+    model win probability or the price/edge/EV gates.
+    """
+    fid=int(fid)
+    cur=_pressure_sample(stats,elapsed)
+    raw_state=_RECENT_MOMENTUM_STATE.get(fid)
+    if isinstance(raw_state,dict) and "history" in raw_state:
+        history=list(raw_state.get("history") or [])
+    elif isinstance(raw_state,dict) and "minute" in raw_state:
+        history=[raw_state]  # compatibility with bootstrap/older V7.2 state
+    else:
+        history=[]
+
+    # Reset malformed/stale state, otherwise retain roughly the last 12 match minutes.
+    if history and float(cur["minute"]) < float(history[-1].get("minute",cur["minute"])):
+        history=[]
+    history=[h for h in history if 0.0 <= float(cur["minute"]-h.get("minute",cur["minute"])) <= 12.0]
+
+    w5=_window_delta(history,cur,5)
+    w10=_window_delta(history,cur,10)
+    c5=_pressure_components(w5)
+    c10=_pressure_components(w10)
+    p5=float(c5["signal"]); p10=float(c10["signal"])
+    if pd.isna(fnum(w5.get("minutes"))): p5=p10
+    if pd.isna(fnum(w10.get("minutes"))): p10=p5
+    accel=float(np.clip(p5/max(0.35,p10),0.50,2.00))
+
+    # Corner lane keeps the old corner-dominant logic from the widest usable window.
+    use=w10 if not pd.isna(fnum(w10.get("minutes"))) else w5
+    dm=fnum(use.get("minutes")); dc=fnum(use.get("corners")); ds=fnum(use.get("shots")); dst=fnum(use.get("sot"))
+    if pd.isna(dm) or dm <= 0:
+        corner_signal=1.0
+    else:
+        cr=1.0 if pd.isna(dc) else np.clip((dc/dm)/(9.5/90.0),0.0,3.0)
+        sr=1.0 if pd.isna(ds) else np.clip((ds/dm)/(24.0/90.0),0.0,2.5)
+        tr=1.0 if pd.isna(dst) else np.clip((dst/dm)/(8.4/90.0),0.0,3.0)
+        corner_signal=float(0.65*cr+0.22*sr+0.13*tr)
+    corner_mult=float(np.clip(1.0+0.22*(corner_signal-1.0),CORNER_MOMENTUM_MIN_MULT,CORNER_MOMENTUM_MAX_MULT))
+
+    # Recent pressure dominates this multiplier, while acceleration gets a smaller
+    # role. This layer is then shrunk again inside goal lambda to avoid double count.
+    combined=0.58*p5+0.30*p10+0.12*accel
+    goal_mult=float(np.clip(1.0+0.17*(combined-1.0),GOAL_PRESSURE_MIN_MULT,GOAL_PRESSURE_MAX_MULT))
+    phase=float(_goal_phase_multiplier(elapsed))
+    xgr=0.60*c5["xg_ratio"]+0.40*c10["xg_ratio"]
+    # 0-100 research score. Neutral pressure sits around the mid-40s/low-50s.
+    score=100.0*(
+        0.45*np.clip(p5/2.6,0.0,1.0)
+        +0.25*np.clip(p10/2.2,0.0,1.0)
+        +0.15*np.clip(xgr/3.0,0.0,1.0)
+        +0.10*np.clip(accel/1.8,0.0,1.0)
+        +0.05*np.clip(phase/1.15,0.0,1.0)
+    )
+    score=float(np.clip(score,0.0,100.0))
+
+    stats.update({
+        "recent_window_minutes": use.get("minutes"),
+        "recent_corners_delta": use.get("corners"),
+        "recent_shots_delta": use.get("shots"),
+        "recent_sot_delta": use.get("sot"),
+        "corner_momentum_signal": corner_signal,
+        "corner_momentum_multiplier": corner_mult,
+        "pressure_5m": p5,
+        "pressure_10m": p10,
+        "pressure_acceleration": accel,
+        "recent_xg_proxy_5m": c5["xg_proxy"],
+        "recent_xg_proxy_10m": c10["xg_proxy"],
+        "goal_pressure_multiplier": goal_mult,
+        "goal_phase_multiplier": phase,
+        "goal_imminence_score": score,
+    })
+
+    history.append(cur)
+    # Keep one sample per distinct match minute and cap memory.
+    dedup={float(h.get("minute",0.0)):h for h in history}
+    history=[dedup[k] for k in sorted(dedup)][-8:]
+    _RECENT_MOMENTUM_STATE[fid]={"history":history, **cur}
+    return corner_mult
 
 def _bootstrap_recent_momentum_from_research(max_rows=12000):
     """Seed the tiny momentum cache from the latest stored snapshot after a restart."""
@@ -897,12 +1027,15 @@ def _bootstrap_recent_momentum_from_research(max_rows=12000):
             def pair(a,b):
                 x,y=fnum(r.get(a)),fnum(r.get(b))
                 return np.nan if pd.isna(x) or pd.isna(y) else float(x)+float(y)
-            _RECENT_MOMENTUM_STATE[int(fid)]={
+            sample={
                 "minute":float(minute),
                 "corners":pair("home_corners","away_corners"),
                 "shots":pair("home_shots","away_shots"),
                 "sot":pair("home_sot","away_sot"),
+                "xg":np.nan,
+                "danger":np.nan,
             }
+            _RECENT_MOMENTUM_STATE[int(fid)]={"history":[sample], **sample}
     except Exception:
         pass
 
@@ -1237,7 +1370,8 @@ def scan_live(key):
                 k: np.nan for k in [
                     "home_sot","away_sot","home_shots","away_shots",
                     "home_corners","away_corners","home_poss","away_poss",
-                    "home_red","away_red","home_yellow","away_yellow","second_half_corners",
+                    "home_red","away_red","home_yellow","away_yellow","home_xg","away_xg",
+                    "home_dangerous_attacks","away_dangerous_attacks","second_half_corners",
                     "second_half_home_sot","second_half_away_sot","second_half_home_shots","second_half_away_shots",
                     "second_half_home_goals","second_half_away_goals"
                 ]
@@ -1412,6 +1546,16 @@ def scan_live(key):
                 and mq >= family_q_min
                 and ev >= 0.0
             )
+            goal_imminence_candidate = bool(
+                kind in {"goal_total","goal_total_1h","goal_total_2h"}
+                and str(detail.get("side") or "").lower() == "over"
+                and official_p >= GOAL_IMMINENCE_MIN_MODEL_PROB
+                and med >= MIN_ODDS
+                and fnum(stats.get("goal_imminence_score")) >= GOAL_IMMINENCE_MIN_SCORE
+                and minutes_to_settle <= GOAL_IMMINENCE_MAX_MINUTES_TO_SETTLE
+                and mq >= family_q_min
+                and ev >= 0.0
+            )
 
             # Human-readable live selection including handicap/line.
             selection_display = value
@@ -1435,7 +1579,7 @@ def scan_live(key):
                 "market_family":kind,
                 "period_lane":("1H" if kind.endswith("_1h") else "2H" if kind.endswith("_2h") else "FT"),
                 "minutes_to_settle":minutes_to_settle,
-                "taxonomy_version":"FAST_MOMENTUM_V7_2",
+                "taxonomy_version":"PRESSURE_FIRST_V7_3",
                 "live_odds":med,
                 "model_probability_raw":p_win_raw,
                 "push_probability_raw":p_push_raw,
@@ -1452,6 +1596,7 @@ def scan_live(key):
                 "rank_score":rank_score,
                 "high_confidence_80":bool(eligible and official_p >= HIGH_CONF_PROB),
                 "momentum_fast_candidate":momentum_fast_candidate,
+                "goal_imminence_candidate":goal_imminence_candidate,
                 "eligible":eligible,
                 "main":quote.get("main"),
                 "update":quote.get("update"),
@@ -1467,6 +1612,16 @@ def scan_live(key):
                 "recent_sot_delta":stats.get("recent_sot_delta"),
                 "corner_momentum_signal":stats.get("corner_momentum_signal"),
                 "corner_momentum_multiplier":stats.get("corner_momentum_multiplier"),
+                "pressure_5m":stats.get("pressure_5m"),
+                "pressure_10m":stats.get("pressure_10m"),
+                "pressure_acceleration":stats.get("pressure_acceleration"),
+                "recent_xg_proxy_5m":stats.get("recent_xg_proxy_5m"),
+                "recent_xg_proxy_10m":stats.get("recent_xg_proxy_10m"),
+                "goal_pressure_multiplier":stats.get("goal_pressure_multiplier"),
+                "goal_phase_multiplier":stats.get("goal_phase_multiplier"),
+                "goal_imminence_score":stats.get("goal_imminence_score"),
+                "home_xg":stats.get("home_xg"),
+                "away_xg":stats.get("away_xg"),
                 "home_poss":stats.get("home_poss"),
                 "away_poss":stats.get("away_poss"),
             })
@@ -1651,6 +1806,27 @@ def momentum_fast_board(opp_df):
                     ascending=[False,False,False,False]).reset_index(drop=True)
     e["momentum_fast_rank"]=range(1,len(e)+1)
     e["selection_role"]="MOMENTUM_FAST_80PLUS_RESEARCH"
+    return e
+
+
+def goal_imminence_board(opp_df, min_score=None):
+    """Pressure-first goal research lane. Score is not a model win probability."""
+    if min_score is None:
+        min_score=GOAL_IMMINENCE_MIN_SCORE
+    if opp_df is None or opp_df.empty or "goal_imminence_candidate" not in opp_df.columns:
+        return opp_df.iloc[0:0] if opp_df is not None else pd.DataFrame()
+    e=opp_df[opp_df["goal_imminence_candidate"].fillna(False)].copy()
+    if e.empty: return e
+    e=_dedupe_equivalent_quotes(e)
+    e["goal_imminence_score"]=pd.to_numeric(e.get("goal_imminence_score"),errors="coerce")
+    e=e[e["goal_imminence_score"]>=float(min_score)].copy()
+    if e.empty: return e
+    e=e.sort_values(
+        ["goal_imminence_score","model_probability_effective","estimated_ev","live_odds"],
+        ascending=[False,False,False,False]
+    ).drop_duplicates("fixture_id",keep="first").reset_index(drop=True)
+    e["goal_imminence_rank"]=range(1,len(e)+1)
+    e["selection_role"]="GOAL_IMMINENCE_RESEARCH"
     return e
 
 
@@ -1994,7 +2170,7 @@ def main():
     print_threshold_audit()
 
     print("="*110)
-    print("DDD LIVE VALUE ENGINE V7.2 — FAST MOMENTUM PERIOD-AWARE")
+    print("DDD LIVE VALUE ENGINE V7.3 — PRESSURE-FIRST GOAL + FAST MOMENTUM")
     print("="*110)
     print("ENGINE COMMITTED:", dest)
     print("API KEY: FOUND (hidden)")

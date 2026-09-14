@@ -24,6 +24,9 @@ import ddd_engine_v72 as ddd
 API_KEY = os.environ.get("API_FOOTBALL_KEY", "").strip()
 SCAN_SECONDS = int(os.environ.get("DDD_SCAN_SECONDS", "300"))
 IDLE_SCAN_SECONDS = int(os.environ.get("DDD_IDLE_SCAN_SECONDS", "900"))
+HOT_SCAN_SECONDS = int(os.environ.get("DDD_HOT_SCAN_SECONDS", "120"))
+CRITICAL_SCAN_SECONDS = int(os.environ.get("DDD_CRITICAL_SCAN_SECONDS", "60"))
+ADAPTIVE_SCAN_MIN_QUOTA = int(os.environ.get("DDD_ADAPTIVE_SCAN_MIN_QUOTA", "1200"))
 DAILY_REQUEST_LIMIT = int(os.environ.get("DDD_DAILY_REQUEST_LIMIT", "6500"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -42,6 +45,24 @@ ROLLOVER_EXCEPTION_MAX_ODDS = float(os.environ.get("DDD_ROLLOVER_EXCEPTION_MAX_O
 ROLLOVER_EXCEPTION_MIN_PROB = float(os.environ.get("DDD_ROLLOVER_EXCEPTION_MIN_PROB", "0.90"))
 ROLLOVER_EXCEPTION_MIN_EDGE = float(os.environ.get("DDD_ROLLOVER_EXCEPTION_MIN_EDGE", "0.06"))
 ROLLOVER_EXCEPTION_MIN_EV = float(os.environ.get("DDD_ROLLOVER_EXCEPTION_MIN_EV", "0.05"))
+
+# WIN-FIRST safety mode: prioritize realized hit-rate/calibration over breadth.
+WIN_FIRST_MODE = os.environ.get("DDD_WIN_FIRST_MODE", "1").strip() not in {"0","false","False"}
+WIN_FIRST_MIN_PROB = float(os.environ.get("DDD_WIN_FIRST_MIN_PROB", "0.85"))
+WIN_FIRST_MIN_EDGE = float(os.environ.get("DDD_WIN_FIRST_MIN_EDGE", "0.06"))
+WIN_FIRST_MIN_EV = float(os.environ.get("DDD_WIN_FIRST_MIN_EV", "0.05"))
+WIN_FIRST_BLOCK_CORNER_UNDERS = os.environ.get(
+    "DDD_WIN_FIRST_BLOCK_CORNER_UNDERS", "1"
+).strip() not in {"0","false","False"}
+WIN_FIRST_SEED_MIN_SAMPLES = int(os.environ.get("DDD_WIN_FIRST_SEED_MIN_SAMPLES", "10"))
+WIN_FIRST_RUNTIME_MIN_SAMPLES = int(os.environ.get("DDD_WIN_FIRST_RUNTIME_MIN_SAMPLES", "20"))
+WIN_FIRST_MIN_HIT_RATE = float(os.environ.get("DDD_WIN_FIRST_MIN_HIT_RATE", "0.80"))
+
+# Conservative bootstrap from the latest settled DDD research snapshot available
+# before this patch, deduplicated by fixture/market/selection/line.
+WIN_FIRST_SEED = {
+    ("goal_total", "under"): {"n": 11, "wins": 10, "min_p": 0.85},
+}
 
 ddd.MIN_ODDS = float(os.environ.get("DDD_MIN_ODDS", "1.20"))
 ddd.MIN_MODEL_PROB = float(os.environ.get("DDD_MIN_MODEL_PROB", "0.65"))
@@ -73,6 +94,7 @@ _state = {
     "official": [],
     "fast_period": [],
     "momentum_fast": [],
+    "goal_imminence": [],
     "watch": [],
     "closest": [],
     "fixtures": [],
@@ -86,6 +108,9 @@ _state = {
     "rollover_chain_no": 0,
     "rollover_stopped": False,
     "rollover_last_result": None,
+    "win_first_mode": WIN_FIRST_MODE,
+    "win_first_min_prob": WIN_FIRST_MIN_PROB,
+    "win_first_block_corner_unders": WIN_FIRST_BLOCK_CORNER_UNDERS,
     "error": None,
 }
 
@@ -140,13 +165,18 @@ CARD_COLS = [
     "live_odds","model_probability_effective","push_probability_raw",
     "estimated_edge","estimated_ev","data_quality","market_data_quality",
     "corner_momentum_multiplier","recent_window_minutes",
-    "recent_corners_delta","recent_shots_delta","recent_sot_delta"
+    "recent_corners_delta","recent_shots_delta","recent_sot_delta",
+    "pressure_5m","pressure_10m","pressure_acceleration",
+    "recent_xg_proxy_5m","recent_xg_proxy_10m","goal_pressure_multiplier",
+    "goal_phase_multiplier","goal_imminence_score","home_xg","away_xg"
 ]
 
 FIXTURE_COLS = [
     "fixture_id","minute","status","home","away","home_goals","away_goals",
     "league","country","data_quality","live_odds_rows",
-    "home_corners","away_corners","home_shots","away_shots","home_sot","away_sot"
+    "home_corners","away_corners","home_shots","away_shots","home_sot","away_sot",
+    "pressure_5m","pressure_10m","pressure_acceleration","goal_imminence_score",
+    "goal_pressure_multiplier","home_xg","away_xg"
 ]
 
 def _warning_list(row):
@@ -278,13 +308,16 @@ def _telegram_startup_confirm_once():
 
     text = (
         "✅ DDD Telegram connected\n"
-        "V7.2 Top-1 rollover monitor is online.\n\n"
+        "V7.2 WIN-FIRST safety monitor is online.\n\n"
         "• Live scan: every 5 minutes\n"
-        "• Normal rollover odds floor: 1.25\n"
-        "• Preferred odds zone: 1.30–1.55\n"
-        "• 1.20–1.24 only for exceptional ≥90% model signals\n"
-        "• One active rollover signal at a time\n\n"
-        "Waiting for the next qualifying live signal."
+        "• Top-1 minimum model probability: 85%\n"
+        "• Minimum edge: 6% | minimum EV: 5%\n"
+        "• Normal odds floor: 1.25\n"
+        "• Corner UNDER signals: suspended\n"
+        "• Unproven markets are blocked until settled evidence is sufficient\n"
+        "• One active signal at a time\n"
+        "• Fixed-stake validation only; no loss chasing\n\n"
+        "No qualifier = no bet."
     )
 
     try:
@@ -523,6 +556,99 @@ def _minutes_to_settle(row):
         return max(0, 90 - minute)
     return 999
 
+
+def _selection_side(row):
+    s = str(row.get("selection") or "").strip().lower()
+    if s.startswith("under"): return "under"
+    if s.startswith("over"): return "over"
+    if s.startswith("home"): return "home"
+    if s.startswith("away"): return "away"
+    if s.startswith("draw"): return "draw"
+    if s.startswith("yes"): return "yes"
+    if s.startswith("no"): return "no"
+    return "other"
+
+def _runtime_calibration(family, side):
+    """Deduplicated high-confidence runtime settlements for a market/side."""
+    path = getattr(ddd, "RESEARCH_SETTLED_DB", None)
+    if path is None:
+        return {"n": 0, "wins": 0, "hit": None}
+    try:
+        path = Path(path)
+        if not path.exists():
+            return {"n": 0, "wins": 0, "hit": None}
+        z = pd.read_csv(path)
+    except Exception:
+        return {"n": 0, "wins": 0, "hit": None}
+
+    needed = {"settlement", "market_family", "selection", "model_probability_effective"}
+    if z.empty or not needed.issubset(z.columns):
+        return {"n": 0, "wins": 0, "hit": None}
+
+    z = z[z["settlement"].isin(["WIN", "LOSS"])].copy()
+    z["model_probability_effective"] = pd.to_numeric(
+        z["model_probability_effective"], errors="coerce"
+    )
+
+    def side_of(s):
+        s = str(s).strip().lower()
+        for k in ("under", "over", "home", "away", "draw", "yes", "no"):
+            if s.startswith(k):
+                return k
+        return "other"
+
+    z["_side"] = z["selection"].map(side_of)
+    z = z[
+        (z["market_family"].astype(str) == str(family))
+        & (z["_side"] == side)
+        & (z["model_probability_effective"] >= WIN_FIRST_MIN_PROB)
+    ].copy()
+
+    if z.empty:
+        return {"n": 0, "wins": 0, "hit": None}
+
+    dedupe = [c for c in ("fixture_id", "market_family", "selection", "handicap") if c in z.columns]
+    if dedupe:
+        if "snapshot_ts" in z.columns:
+            z = z.sort_values("snapshot_ts", kind="stable")
+        z = z.drop_duplicates(dedupe, keep="last")
+
+    n = int(len(z))
+    wins = int((z["settlement"] == "WIN").sum())
+    return {"n": n, "wins": wins, "hit": (wins / n if n else None)}
+
+def _calibration_for_candidate(row):
+    family = str(row.get("market_family") or "")
+    side = _selection_side(row)
+    runtime = _runtime_calibration(family, side)
+    seed = WIN_FIRST_SEED.get((family, side))
+
+    n = int(runtime.get("n") or 0)
+    wins = int(runtime.get("wins") or 0)
+    source = "runtime"
+
+    p = _n(row.get("model_probability_effective"), 0.0)
+    if seed and p >= float(seed.get("min_p", 0.0)):
+        n += int(seed.get("n") or 0)
+        wins += int(seed.get("wins") or 0)
+        source = "seed+runtime" if runtime.get("n") else "seed"
+
+    hit = (wins / n) if n else None
+    min_samples = WIN_FIRST_SEED_MIN_SAMPLES if seed else WIN_FIRST_RUNTIME_MIN_SAMPLES
+    trusted = bool(
+        n >= min_samples
+        and hit is not None
+        and hit >= WIN_FIRST_MIN_HIT_RATE
+    )
+    return {
+        "n": n,
+        "wins": wins,
+        "hit": hit,
+        "source": source,
+        "trusted": trusted,
+        "min_samples": min_samples,
+    }
+
 def _select_rollover_candidate(rows):
     if not rows:
         return None
@@ -531,6 +657,7 @@ def _select_rollover_candidate(rows):
     for r0 in rows:
         r = dict(r0)
         fam = str(r.get("market_family") or "")
+        side = _selection_side(r)
         p = _n(r.get("model_probability_effective"), 0.0)
         odds = _n(r.get("live_odds"), 0.0)
         edge = _n(r.get("estimated_edge"), 0.0)
@@ -540,17 +667,42 @@ def _select_rollover_candidate(rows):
 
         if fam not in ROLLOVER_SUPPORTED_FAMILIES or fid in (None, ""):
             continue
-        if p < ddd.HIGH_CONF_PROB or edge < ddd.MIN_EDGE or ev < ddd.MIN_EV:
-            continue
+
+        if WIN_FIRST_MODE:
+            if p < max(ddd.HIGH_CONF_PROB, WIN_FIRST_MIN_PROB):
+                continue
+            if edge < max(ddd.MIN_EDGE, WIN_FIRST_MIN_EDGE):
+                continue
+            if ev < max(ddd.MIN_EV, WIN_FIRST_MIN_EV):
+                continue
+
+            # Suspend all corner-under signals until that market is recalibrated.
+            if WIN_FIRST_BLOCK_CORNER_UNDERS and fam.startswith("corner_total") and side == "under":
+                continue
+
+            # No low-odds exception lane in WIN-FIRST mode.
+            if odds < ROLLOVER_STRICT_MIN_ODDS:
+                continue
+
+            cal = _calibration_for_candidate(r)
+            if not cal["trusted"]:
+                continue
+
+            r["calibration_n"] = cal["n"]
+            r["calibration_wins"] = cal["wins"]
+            r["calibration_hit_rate"] = cal["hit"]
+            r["calibration_source"] = cal["source"]
+        else:
+            if p < ddd.HIGH_CONF_PROB or edge < ddd.MIN_EDGE or ev < ddd.MIN_EV:
+                continue
+
         if push > ROLLOVER_MAX_PUSH:
             continue
 
-        # Normal rollover lane: 1.25+
         normal_lane = odds >= ROLLOVER_STRICT_MIN_ODDS
-
-        # Exceptional low-odds lane: 1.20-1.24 only when the signal is unusually strong.
         exception_lane = (
-            ROLLOVER_EXCEPTION_MIN_ODDS <= odds <= ROLLOVER_EXCEPTION_MAX_ODDS
+            (not WIN_FIRST_MODE)
+            and ROLLOVER_EXCEPTION_MIN_ODDS <= odds <= ROLLOVER_EXCEPTION_MAX_ODDS
             and p >= ROLLOVER_EXCEPTION_MIN_PROB
             and edge >= ROLLOVER_EXCEPTION_MIN_EDGE
             and ev >= ROLLOVER_EXCEPTION_MIN_EV
@@ -568,16 +720,19 @@ def _select_rollover_candidate(rows):
         r["_odds"] = odds
         r["_edge"] = edge
         r["_ev"] = ev
-        r["_minute"] = int(_n(r.get("minute"), 0) or 0)
+        r["_cal_hit"] = float(r.get("calibration_hit_rate") or 0.0)
+        r["_cal_n"] = int(r.get("calibration_n") or 0)
         cleaned.append(r)
 
     if not cleaned:
         return None
 
-    # Probability is the first ranking dimension.
+    # WIN-FIRST: actual/calibrated hit-rate first, then model probability.
     cleaned.sort(
         key=lambda r: (
+            r["_cal_hit"] if WIN_FIRST_MODE else r["_p"],
             r["_p"],
+            r["_cal_n"],
             int(r["preferred_odds_zone"]),
             r["_ev"],
             r["_edge"],
@@ -585,23 +740,24 @@ def _select_rollover_candidate(rows):
         ),
         reverse=True,
     )
-    pmax = cleaned[0]["_p"]
 
-    # Rollover tie-break: only inside the configured probability tolerance do
-    # we allow faster settlement to outrank the marginally higher probability.
-    near = [r for r in cleaned if r["_p"] >= pmax - ROLLOVER_FAST_TOLERANCE]
-    near.sort(
-        key=lambda r: (
-            -r["minutes_to_settle"],
-            int(r["preferred_odds_zone"]),
-            r["_p"],
-            r["_ev"],
-            r["_edge"],
-            r["_odds"],
-        ),
-        reverse=True,
-    )
-    chosen = near[0] if near else cleaned[0]
+    if WIN_FIRST_MODE:
+        chosen = cleaned[0]
+    else:
+        pmax = cleaned[0]["_p"]
+        near = [r for r in cleaned if r["_p"] >= pmax - ROLLOVER_FAST_TOLERANCE]
+        near.sort(
+            key=lambda r: (
+                -r["minutes_to_settle"],
+                int(r["preferred_odds_zone"]),
+                r["_p"],
+                r["_ev"],
+                r["_edge"],
+                r["_odds"],
+            ),
+            reverse=True,
+        )
+        chosen = near[0] if near else cleaned[0]
 
     for k in list(chosen):
         if k.startswith("_"):
@@ -671,13 +827,19 @@ def _send_rollover_signal(candidate, snapshot):
     scan_utc = (snapshot.get("last_scan_utc") or datetime.now(timezone.utc).isoformat()).replace("+00:00","Z")
     png = _render_rollover_png(candidate, chain_no, scan_utc[:19].replace("T"," "))
     settle_at = "HT" if str(candidate.get("period_lane") or "") == "1H" else "FT"
+    cal_hit = candidate.get("calibration_hit_rate")
+    cal_n = int(candidate.get("calibration_n") or 0)
+    cal_txt = (
+        f" | Calibrated hit {_fmt_pct(cal_hit)} (n={cal_n})"
+        if cal_hit is not None and cal_n > 0 else ""
+    )
     caption = (
-        f"DDD ROLLOVER SIGNAL #{chain_no}\n"
+        f"DDD TOP-1 WIN-FIRST SIGNAL #{chain_no}\n"
         f"{candidate.get('home','')} vs {candidate.get('away','')}\n"
         f"{candidate.get('market','') or candidate.get('market_family','')} — {candidate.get('selection','')}\n"
-        f"Model {_fmt_pct(candidate.get('model_probability_effective'))} | Odds {_fmt_num(candidate.get('live_odds'),2)}\n"
+        f"Model {_fmt_pct(candidate.get('model_probability_effective'))} | Odds {_fmt_num(candidate.get('live_odds'),2)}{cal_txt}\n"
         f"Settlement target: {settle_at}\n"
-        f"Only one rollover signal remains active at a time."
+        f"Fixed-stake validation only. Do not chase a loss."
     )
     try:
         r = requests.post(
@@ -835,9 +997,9 @@ def _finish_rollover(settled):
         f"Observed: {settled.get('observed')}\n"
     )
     if result == "WIN":
-        txt += "Chain unlocked. The next qualifying scan may issue the next rollover signal."
+        txt += "Signal closed. A later qualifier is independent; keep the stake fixed."
     elif result == "PUSH":
-        txt += "Push/void: chain unlocked with stake unchanged."
+        txt += "Push/void: signal closed; keep the next stake fixed."
     else:
         if ROLLOVER_STOP_ON_LOSS:
             txt += "Chain stopped. No automatic recovery/chasing signal will be issued."
@@ -882,6 +1044,7 @@ def run_scan():
     official, alts, high80, coverage = ddd.qualifying_boards(opp)
     fast, one, two, ft, safest = ddd.period_aware_boards(opp)
     momentum = ddd.momentum_fast_board(opp)
+    goal_imminence = ddd.goal_imminence_board(opp) if hasattr(ddd, "goal_imminence_board") else pd.DataFrame()
     watch = ddd.watch_board(opp, ddd.WATCH_MIN_PROB)
     picks = ddd.pick_independent(opp)
 
@@ -894,10 +1057,23 @@ def run_scan():
     closest = _closest_board(opp, 8)
 
     live_count = len(fixtures) if fixtures is not None else 0
+    with _lock:
+        quota_remaining = max(0, DAILY_REQUEST_LIMIT - _state.get("request_count_today", 0))
     if live_count == 0:
         interval = IDLE_SCAN_SECONDS
     else:
         interval = SCAN_SECONDS
+        # Adaptive acceleration only when a real shortlist exists and enough quota
+        # remains. This captures pressure changes faster without burning the daily API
+        # allowance by scanning every live game every 30 seconds all day.
+        if quota_remaining >= ADAPTIVE_SCAN_MIN_QUOTA:
+            max_goal_score = 0.0
+            if goal_imminence is not None and not goal_imminence.empty and "goal_imminence_score" in goal_imminence:
+                max_goal_score = float(pd.to_numeric(goal_imminence["goal_imminence_score"], errors="coerce").max() or 0.0)
+            if max_goal_score >= 82.0:
+                interval = min(interval, CRITICAL_SCAN_SECONDS)
+            elif (goal_imminence is not None and not goal_imminence.empty) or (fast is not None and not fast.empty) or (momentum is not None and not momentum.empty) or (picks is not None and not picks.empty):
+                interval = min(interval, HOT_SCAN_SECONDS)
 
     now = datetime.now(timezone.utc)
     snapshot = {
@@ -911,6 +1087,7 @@ def run_scan():
         "official": _records(picks, 8, CARD_COLS),
         "fast_period": _records(fast, 8, CARD_COLS),
         "momentum_fast": _records(momentum, 8, CARD_COLS),
+        "goal_imminence": _records(goal_imminence, 8, CARD_COLS),
         "watch": _records(watch, 8, CARD_COLS),
         "closest": closest,
         "fixtures": _records(fixtures, 40, FIXTURE_COLS),
@@ -1002,6 +1179,12 @@ def health():
             "rollover_min_odds": ROLLOVER_STRICT_MIN_ODDS,
             "rollover_preferred_odds": [ROLLOVER_PREF_MIN_ODDS, ROLLOVER_PREF_MAX_ODDS],
             "rollover_exception_odds": [ROLLOVER_EXCEPTION_MIN_ODDS, ROLLOVER_EXCEPTION_MAX_ODDS],
+            "win_first_mode": WIN_FIRST_MODE,
+            "win_first_min_prob": WIN_FIRST_MIN_PROB,
+            "win_first_min_edge": WIN_FIRST_MIN_EDGE,
+            "win_first_min_ev": WIN_FIRST_MIN_EV,
+            "win_first_block_corner_unders": WIN_FIRST_BLOCK_CORNER_UNDERS,
+            "win_first_min_hit_rate": WIN_FIRST_MIN_HIT_RATE,
             "error": _state["error"],
         })
 
@@ -1032,10 +1215,11 @@ section{margin-top:22px}h2{font-size:18px}.fixture{font-size:14px}
 </style>
 </head>
 <body><main>
-<h1>DDD V7.2 Live Monitor</h1>
-<div class="small">HARD80 actual-win • probability first • fast period • recent momentum</div>
+<h1>DDD V7.3 Live Monitor</h1>
+<div class="small">HARD80 actual-win • probability first • 5/10-min pressure • xG proxy • adaptive scan</div>
 <div id="top" class="bar"></div>
 <section><h2>OFFICIAL ≥80%</h2><div id="official"></div></section>
+<section><h2>GOAL IMMINENCE — PRESSURE LANE</h2><div id="goal"></div></section>
 <section><h2>FAST / MOMENTUM</h2><div id="fast"></div></section>
 <section><h2>CLOSEST IF NO OFFICIAL</h2><div id="closest"></div></section>
 <section><h2>LIVE GAMES BEING SCANNED</h2><div id="fixtures"></div></section>
@@ -1049,6 +1233,7 @@ function card(r,cls=''){
  <div><b>${r.home||''}</b> vs <b>${r.away||''}</b> ${r.minute!=null?'· '+r.minute+"'":''}</div>
  <div class="market">${r.market||r.market_family||''} — ${r.selection||''}</div>
  <div class="small">${r.period_lane||''} · odds ${odd(r.live_odds)} · edge ${pct(r.estimated_edge)} · EV ${pct(r.estimated_ev)}</div>
+ ${r.goal_imminence_score!=null?`<div class="small">Pressure ${Number(r.goal_imminence_score).toFixed(0)}/100 · 5m ${r.pressure_5m==null?'—':Number(r.pressure_5m).toFixed(2)}× · 10m ${r.pressure_10m==null?'—':Number(r.pressure_10m).toFixed(2)}×</div>`:''}
  </div><div class="p">${pct(r.model_probability_effective)}</div></div>
  ${w?'<div class="warns">'+w+'</div>':''}</div>`;
 }
@@ -1064,12 +1249,14 @@ async function load(){
    `<span class="badge">${d.rollover_stopped?"ROLLOVER STOPPED":(d.rollover_active?"ROLLOVER ACTIVE #"+d.rollover_chain_no:"ROLLOVER READY")}</span>`;
   const official=d.official||[];
   document.getElementById('official').innerHTML=official.length?official.map(x=>card(x,'good')).join(''):'<div class="empty">No strict HARD80 signal.</div>';
+  const g=d.goal_imminence||[];
+  document.getElementById('goal').innerHTML=g.length?g.map(x=>card(x,'warn')).join(''):'<div class="empty">No 70+ pressure-lane goal candidate.</div>';
   const f=[...(d.fast_period||[]),...(d.momentum_fast||[])];
   document.getElementById('fast').innerHTML=f.length?f.map(x=>card(x,'good')).join(''):'<div class="empty">No fast-period/momentum qualifier.</div>';
   const c=d.closest||[];
   document.getElementById('closest').innerHTML=c.length?c.map(x=>card(x,'warn')).join(''):'<div class="empty">No priced candidate available.</div>';
   const fx=d.fixtures||[];
-  document.getElementById('fixtures').innerHTML=fx.length?fx.map(x=>`<div class="card fixture"><b>${x.home}</b> ${x.home_goals??0}-${x.away_goals??0} <b>${x.away}</b> · ${x.minute??'—'}' · odds rows ${x.live_odds_rows??0} · quality ${pct(x.data_quality)}</div>`).join(''):'<div class="empty">No live fixtures in current scan.</div>';
+  document.getElementById('fixtures').innerHTML=fx.length?fx.map(x=>`<div class="card fixture"><b>${x.home}</b> ${x.home_goals??0}-${x.away_goals??0} <b>${x.away}</b> · ${x.minute??'—'}' · odds rows ${x.live_odds_rows??0} · quality ${pct(x.data_quality)}${x.goal_imminence_score!=null?' · pressure '+Number(x.goal_imminence_score).toFixed(0)+'/100':''}</div>`).join(''):'<div class="empty">No live fixtures in current scan.</div>';
  }catch(e){}
 }
 load(); setInterval(load,15000);
