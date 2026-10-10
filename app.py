@@ -1262,3 +1262,45 @@ async function load(){
 load(); setInterval(load,15000);
 </script></body></html>"""
     return Response(html, mimetype="text/html")
+
+
+# OddAlerts connection diagnostics (separate from API-Football live scanner).
+# No credentials, fixture payloads or bookmaker data are exposed publicly.
+_oa_probe = {"at": 0.0, "result": None}
+_oa_probe_lock = threading.Lock()
+
+@app.get("/api/oddalerts/status")
+def oddalerts_status():
+    from oddalerts_bridge import configured
+    if not configured():
+        return jsonify({"provider": "OddAlerts", "configured": False,
+                        "connected": False, "status": "WAITING_FOR_TOKEN"})
+    with _oa_probe_lock:
+        now = time.monotonic()
+        if _oa_probe["result"] is not None and now - _oa_probe["at"] < 300:
+            return jsonify(_oa_probe["result"])
+        import requests
+        token = os.environ["ODDALERTS_TOKEN"].strip()
+        result = {"provider": "OddAlerts", "configured": True,
+                  "connected": False, "status": "ERROR"}
+        try:
+            response = requests.get(
+                "https://data.oddalerts.com/api/fixtures/upcoming",
+                params={"api_token": token, "per_page": 1},
+                timeout=15, allow_redirects=False)
+            if response.status_code == 200:
+                body = response.json()
+                if isinstance(body, dict) and isinstance(body.get("data"), list):
+                    result.update({"connected": True, "status": "CONNECTED"})
+                else:
+                    result["status"] = "UNEXPECTED_RESPONSE"
+            elif response.status_code in (401, 403, 301, 302, 303, 307, 308):
+                result["status"] = "TOKEN_OR_PLAN_REJECTED"
+            elif response.status_code == 429:
+                result["status"] = "RATE_LIMITED"
+            else:
+                result["status"] = "HTTP_" + str(response.status_code)
+        except (requests.RequestException, ValueError):
+            result["status"] = "CONNECTION_ERROR"
+        _oa_probe.update({"at": now, "result": result})
+        return jsonify(result)
